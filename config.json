@@ -2,6 +2,6 @@
   "server": "social.vrutkovs.eu",
   "home-timeline-length": 200,
   "max-followings": 80,
-  "from-notifications": 1,
+  "from-notifications": 0,
   "http-timeout": 30
 }
