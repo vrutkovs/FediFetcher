@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 from datetime import datetime, timedelta
-import string
 from dateutil import parser
 import itertools
 import json
+import logging
 import os
 import re
 import sys
@@ -13,6 +13,14 @@ import time
 import argparse
 import uuid
 import defusedxml.ElementTree as ET
+import urllib.robotparser
+from urllib.parse import urlparse
+import xxhash
+
+logger = logging.getLogger("FediFetcher")
+robotParser = urllib.robotparser.RobotFileParser()
+
+VERSION = "7.1.12"
 
 argparser=argparse.ArgumentParser()
 
@@ -39,6 +47,12 @@ argparser.add_argument('--state-dir', required = False, default="artifacts", hel
 argparser.add_argument('--on-done', required = False, default=None, help="Provide a url that will be pinged when processing has completed. You can use this for 'dead man switch' monitoring of your task")
 argparser.add_argument('--on-start', required = False, default=None, help="Provide a url that will be pinged when processing is starting. You can use this for 'dead man switch' monitoring of your task")
 argparser.add_argument('--on-fail', required = False, default=None, help="Provide a url that will be pinged when processing has failed. You can use this for 'dead man switch' monitoring of your task")
+argparser.add_argument('--from-lists', required=False, type=bool, default=False, help="Set to `1` to fetch missing replies and/or backfill account from your lists. This is disabled by default.")
+argparser.add_argument('--max-list-length', required=False, type=int, default=100, help="Determines how many posts we'll fetch replies for in each list. This will be ignored, unless you also provide `from-lists = 1`. Set to `0` if you only want to backfill profiles in lists.")
+argparser.add_argument('--max-list-accounts', required=False, type=int, default=10, help="Determines how many accounts we'll backfill for in each list. This will be ignored, unless you also provide `from-lists = 1`. Set to `0` if you only want to fetch replies in lists.")
+argparser.add_argument('--log-level', required=False, default="DEBUG", help="Severity of events to log (DEBUG|INFO|WARNING|ERROR|CRITICAL)")
+argparser.add_argument('--log-format', required=False, type=str, default="%(asctime)s: %(message)s",help="Specify the log format")
+argparser.add_argument('--instance-blocklist', required=False, type=str, default="",help="A comma-separated array of instances that FediFetcher should never try to connect to")
 
 def get_notification_users(server, access_token, known_users, max_age):
     since = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=max_age)
@@ -53,7 +67,7 @@ def get_notification_users(server, access_token, known_users, max_age):
 
     new_notification_users = filter_known_users(notification_users, known_users)
 
-    log(f"Found {len(notification_users)} users in notifications, {len(new_notification_users)} of which are new")
+    logger.info(f"Found {len(notification_users)} users in notifications, {len(new_notification_users)} of which are new")
 
     return new_notification_users
 
@@ -83,7 +97,7 @@ def add_user_posts(server, access_token, followings, known_followings, all_known
                             count += 1
                         else:
                             failed += 1
-                log(f"Added {count} posts for user {user['acct']} with {failed} errors")
+                logger.info(f"Added {count} posts for user {user['acct']} with {failed} errors")
                 if failed == 0:
                     known_followings.add(user['acct'])
                     all_known_users.add(user['acct'])
@@ -100,25 +114,38 @@ def add_post_with_context(post, server, access_token, seen_urls, seen_hosts):
             known_context_urls = get_all_known_context_urls(server, [post],parsed_urls, seen_hosts)
             add_context_urls(server, access_token, known_context_urls, seen_urls)
         return True
-    
+
     return False
 
+def user_has_opted_out(user):
+    if 'note' in user and isinstance(user['note'], str) and (' nobot' in user['note'].lower() or '/tags/nobot' in user['note'].lower()):
+        return True
+    if 'indexable' in user and not user['indexable']:
+        return True
+    if 'discoverable' in user and not user['discoverable']:
+        return True
+    return False
+
+
 def get_user_posts(user, known_followings, server, seen_hosts):
+    if user_has_opted_out(user):
+        logger.debug(f"User {user['acct']} has opted out of backfilling")
+        return None
     parsed_url = parse_user_url(user['url'])
 
     if parsed_url == None:
         # We are adding it as 'known' anyway, because we won't be able to fix this.
         known_followings.add(user['acct'])
         return None
-    
+
     if(parsed_url[0] == server):
-        log(f"{user['acct']} is a local user. Skip")
+        logger.debug(f"{user['acct']} is a local user. Skip")
         known_followings.add(user['acct'])
         return None
 
     post_server = get_server_info(parsed_url[0], seen_hosts)
     if post_server is None:
-        log(f'server {parsed_url[0]} not found for post')
+        logger.error(f'server {parsed_url[0]} not found for post')
         return None
 
     if post_server['mastodonApiSupport']:
@@ -130,14 +157,17 @@ def get_user_posts(user, known_followings, server, seen_hosts):
     if post_server['misskeyApiSupport']:
         return get_user_posts_misskey(parsed_url[1], post_server['webserver'])
 
-    log(f'server api unknown for {post_server["webserver"]}, cannot fetch user posts')
+    if post_server['peertubeApiSupport']:
+        return get_user_posts_peertube(parsed_url[1], post_server['webserver'])
+
+    logger.error(f'server api unknown for {post_server["webserver"]}, cannot fetch user posts')
     return None
 
 def get_user_posts_mastodon(userName, webserver):
     try:
         user_id = get_user_id(webserver, userName)
     except Exception as ex:
-        log(f"Error getting user ID for user {userName}: {ex}")
+        logger.error(f"Error getting user ID for user {userName}: {ex}")
         return None
 
     try:
@@ -155,7 +185,7 @@ def get_user_posts_mastodon(userName, webserver):
                 f"Error getting URL {url}. Status code: {response.status_code}"
             )
     except Exception as ex:
-        log(f"Error getting posts for user {userName}: {ex}")
+        logger.error(f"Error getting posts for user {userName}: {ex}")
         return None
 
 def get_user_posts_lemmy(userName, userUrl, webserver):
@@ -172,7 +202,7 @@ def get_user_posts_lemmy(userName, userUrl, webserver):
                 return posts
 
         except Exception as ex:
-            log(f"Error getting community posts for community {userName}: {ex}")
+            logger.error(f"Error getting community posts for community {userName}: {ex}")
         return None
 
     # user
@@ -188,9 +218,22 @@ def get_user_posts_lemmy(userName, userUrl, webserver):
                 for post in all_posts:
                     post['url'] = post['ap_id']
                 return all_posts
-            
+
         except Exception as ex:
-            log(f"Error getting user posts for user {userName}: {ex}")
+            logger.error(f"Error getting user posts for user {userName}: {ex}")
+        return None
+
+def get_user_posts_peertube(userName, webserver):
+    try:
+        url = f'https://{webserver}/api/v1/accounts/{userName}/videos'
+        response = get(url)
+        if response.status_code == 200:
+            return response.json()['data']
+        else:
+            logger.error(f"Error getting posts by user {userName} from {webserver}. Status Code: {response.status_code}")
+            return None
+    except Exception as ex:
+        logger.error(f"Error getting posts by user {userName} from {webserver}. Exception: {ex}")
         return None
 
 def get_user_posts_misskey(userName, webserver):
@@ -209,14 +252,14 @@ def get_user_posts_misskey(userName, webserver):
                     userId = user['id']
                     break
         else:
-            log(f"Error finding user {userName} from {webserver}. Status Code: {resp.status_code}")
+            logger.error(f"Error finding user {userName} from {webserver}. Status Code: {resp.status_code}")
             return None
     except Exception as ex:
-        log(f"Error finding user {userName} from {webserver}. Exception: {ex}")
+        logger.error(f"Error finding user {userName} from {webserver}. Exception: {ex}")
         return None
 
     if userId is None:
-        log(f'Error finding user {userName} from {webserver}: user not found on server in search')
+        logger.error(f'Error finding user {userName} from {webserver}: user not found on server in search')
         return None
 
     try:
@@ -231,12 +274,12 @@ def get_user_posts_misskey(userName, webserver):
                     note.update({ 'url': f"https://{webserver}/notes/{note['id']}" })
             return notes
         else:
-            log(f"Error getting posts by user {userName} from {webserver}. Status Code: {resp.status_code}")
+            logger.error(f"Error getting posts by user {userName} from {webserver}. Status Code: {resp.status_code}")
             return None
     except Exception as ex:
-        log(f"Error getting posts by user {userName} from {webserver}. Exception: {ex}")
+        logger.error(f"Error getting posts by user {userName} from {webserver}. Exception: {ex}")
         return None
-    
+
 
 def get_new_follow_requests(server, access_token, max, known_followings):
     """Get any new follow requests for the specified user, up to the max number provided"""
@@ -245,11 +288,11 @@ def get_new_follow_requests(server, access_token, max, known_followings):
         "Authorization": f"Bearer {access_token}",
     })
 
-    # Remove any we already know about    
+    # Remove any we already know about
     new_follow_requests = filter_known_users(follow_requests, known_followings)
-    
-    log(f"Got {len(follow_requests)} follow_requests, {len(new_follow_requests)} of which are new")
-        
+
+    logger.info(f"Got {len(follow_requests)} follow_requests, {len(new_follow_requests)} of which are new")
+
     return new_follow_requests
 
 def filter_known_users(users, known_users):
@@ -258,28 +301,32 @@ def filter_known_users(users, known_users):
         users
     ))
 
-def get_new_followers(server, user_id, max, known_followers):
+def get_new_followers(server, user_id, access_token, max, known_followers):
     """Get any new followings for the specified user, up to the max number provided"""
-    followers = get_paginated_mastodon(f"https://{server}/api/v1/accounts/{user_id}/followers", max)
+    followers = get_paginated_mastodon(f"https://{server}/api/v1/accounts/{user_id}/followers", max, {
+        "Authorization": f"Bearer {access_token}",
+    })
 
-    # Remove any we already know about    
+    # Remove any we already know about
     new_followers = filter_known_users(followers, known_followers)
-    
-    log(f"Got {len(followers)} followers, {len(new_followers)} of which are new")
-        
+
+    logger.info(f"Got {len(followers)} followers, {len(new_followers)} of which are new")
+
     return new_followers
 
-def get_new_followings(server, user_id, max, known_followings):
+def get_new_followings(server, user_id, access_token, max, known_followings):
     """Get any new followings for the specified user, up to the max number provided"""
-    following = get_paginated_mastodon(f"https://{server}/api/v1/accounts/{user_id}/following", max)
+    following = get_paginated_mastodon(f"https://{server}/api/v1/accounts/{user_id}/following", max, {
+        "Authorization": f"Bearer {access_token}",
+    })
 
-    # Remove any we already know about    
+    # Remove any we already know about
     new_followings = filter_known_users(following, known_followings)
-    
-    log(f"Got {len(following)} followings, {len(new_followings)} of which are new")
-        
+
+    logger.info(f"Got {len(following)} followings, {len(new_followings)} of which are new")
+
     return new_followings
-    
+
 
 def get_user_id(server, user = None, access_token = None):
     """Get the user id from the server, using a username"""
@@ -295,11 +342,11 @@ def get_user_id(server, user = None, access_token = None):
         }
     else:
         raise Exception('You must supply either a user name or an access token, to get an user ID')
-    
+
     response = get(url, headers=headers)
 
     if response.status_code == 200:
-        return response.json()['id'] 
+        return response.json()['id']
     elif response.status_code == 404:
         raise Exception(
             f"User {user} was not found on server {server}."
@@ -309,14 +356,13 @@ def get_user_id(server, user = None, access_token = None):
             f"Error getting URL {url}. Status code: {response.status_code}"
         )
 
-
 def get_timeline(server, access_token, max):
     """Get all post in the user's home timeline"""
 
     url = f"https://{server}/api/v1/timelines/home"
 
     try:
-    
+
         response = get_toots(url, access_token)
 
         if response.status_code == 200:
@@ -341,13 +387,13 @@ def get_timeline(server, access_token, max):
             response = get_toots(response.links['next']['url'], access_token)
             toots = toots + response.json()
     except Exception as ex:
-        log(f"Error getting timeline toots: {ex}")
+        logger.error(f"Error getting timeline toots: {ex}")
         raise
 
-    log(f"Found {len(toots)} toots in timeline")
+    logger.info(f"Found {len(toots)} toots in timeline")
 
     return toots
-    
+
 def get_toots(url, access_token):
     response = get( url, headers={
         "Authorization": f"Bearer {access_token}",
@@ -369,7 +415,7 @@ def get_toots(url, access_token):
         raise Exception(
             f"Error getting URL {url}. Status code: {response.status_code}"
         )
-    
+
 def get_active_user_ids(server, access_token, reply_interval_hours):
     """get all user IDs on the server that have posted a toot in the given
        time interval"""
@@ -384,7 +430,7 @@ def get_active_user_ids(server, access_token, reply_interval_hours):
             if last_status_at is not None:
                 last_active = datetime.strptime(last_status_at, "%Y-%m-%d")
                 if last_active > since:
-                    log(f"Found active user: {user['username']}")
+                    logger.info(f"Found active user: {user['username']}")
                     yield user["id"]
     elif resp.status_code == 401:
         raise Exception(
@@ -415,7 +461,7 @@ def get_all_reply_toots(
             for user_id in user_ids
         )
     )
-    log(f"Found {len(reply_toots)} reply toots")
+    logger.info(f"Found {len(reply_toots)} reply toots")
     return reply_toots
 
 
@@ -428,7 +474,7 @@ def get_reply_toots(user_id, server, access_token, seen_urls, reply_since):
             "Authorization": f"Bearer {access_token}",
         })
     except Exception as ex:
-        log(
+        logger.error(
             f"Error getting replies for user {user_id} on server {server}: {ex}"
         )
         return []
@@ -443,7 +489,7 @@ def get_reply_toots(user_id, server, access_token, seen_urls, reply_since):
             > reply_since
         ]
         for toot in toots:
-            log(f"Found reply toot: {toot['url']}")
+            logger.debug(f"Found reply toot: {toot['url']}")
         return toots
     elif resp.status_code == 403:
         raise Exception(
@@ -456,24 +502,58 @@ def get_reply_toots(user_id, server, access_token, seen_urls, reply_since):
     )
 
 
+def toot_context_can_be_fetched(toot):
+    fetchable = toot["visibility"] in ["public", "unlisted"]
+    if not fetchable:
+        logger.debug(f"Cannot fetch context of private toot {toot['uri']}")
+    return fetchable
+
+
+def toot_context_should_be_fetched(toot):
+    if toot['uri'] not in recently_checked_context:
+        recently_checked_context[toot['uri']] = toot
+        return True
+    else:
+        lastSeen = recently_checked_context[toot['uri']]['lastSeen']
+        createdAt = recently_checked_context[toot['uri']]['created_at']
+
+        # convert to date time, if needed
+        if isinstance(createdAt, str):
+            createdAt = parser.parse(createdAt)
+
+        lastSeenInSeconds = (datetime.now(lastSeen.tzinfo) - lastSeen).total_seconds()
+        ageInSeconds = (datetime.now(createdAt.tzinfo) - createdAt).total_seconds()
+        if(ageInSeconds <= 60 * 60 and lastSeenInSeconds >= 60):
+            # For the first hour: allow refetching once per minute
+            return True
+        if(ageInSeconds <= 24 * 60 * 60 and lastSeenInSeconds >= 10 * 60):
+            # For the rest of the first day: once every 10 minutes
+            return True
+        if(lastSeenInSeconds >= 60 * 60):
+            # After that: hourly
+            return True
+    return False
+
 def get_all_known_context_urls(server, reply_toots, parsed_urls, seen_hosts):
     """get the context toots of the given toots from their original server"""
     known_context_urls = set()
-    
+
     for toot in reply_toots:
         if toot_has_parseable_url(toot, parsed_urls):
             url = toot["url"] if toot["reblog"] is None else toot["reblog"]["url"]
             parsed_url = parse_url(url, parsed_urls)
-            context = get_toot_context(parsed_url[0], parsed_url[1], url, seen_hosts)
-            if context is not None:
-                for item in context:
-                    known_context_urls.add(item)
-            else:
-                log(f"Error getting context for toot {url}")
-    
+            if toot_context_can_be_fetched(toot) and toot_context_should_be_fetched(toot):
+                recently_checked_context[toot['uri']]['lastSeen'] = datetime.now(datetime.now().astimezone().tzinfo)
+                context = get_toot_context(parsed_url[0], parsed_url[1], url, seen_hosts)
+                if context is not None:
+                    for item in context:
+                        known_context_urls.add(item)
+                else:
+                    logger.error(f"Error getting context for toot {url}")
+
     known_context_urls = set(filter(lambda url: not url.startswith(f"https://{server}/"), known_context_urls))
-    log(f"Found {len(known_context_urls)} known context toots")
-    
+    logger.info(f"Found {len(known_context_urls)} known context toots")
+
     return known_context_urls
 
 
@@ -482,7 +562,7 @@ def toot_has_parseable_url(toot,parsed_urls):
     if(parsed is None) :
         return False
     return True
-                
+
 
 def get_all_replied_toot_server_ids(
     server, reply_toots, replied_toot_server_ids, parsed_urls
@@ -525,7 +605,7 @@ def get_replied_toot_server_id(server, toot, replied_toot_server_ids,parsed_urls
         replied_toot_server_ids[o_url] = (url, match)
         return (url, match)
 
-    log(f"Error parsing toot URL {url}")
+    logger.error(f"Error parsing toot URL {url}")
     replied_toot_server_ids[o_url] = None
     return None
 
@@ -533,7 +613,7 @@ def parse_user_url(url):
     match = parse_mastodon_profile_url(url)
     if match is not None:
         return match
-    
+
     match = parse_pleroma_profile_url(url)
     if match is not None:
         return match
@@ -542,13 +622,17 @@ def parse_user_url(url):
     if match is not None:
         return match
 
-# Pixelfed profile paths do not use a subdirectory, so we need to match for them last.
+    match = parse_peertube_profile_url(url)
+    if match is not None:
+        return match
+
+    # Pixelfed profile paths do not use a subdirectory, so we need to match for them last.
     match = parse_pixelfed_profile_url(url)
     if match is not None:
         return match
 
-    log(f"Error parsing Profile URL {url}")
-    
+    logger.error(f"Error parsing Profile URL {url}")
+
     return None
 
 def parse_url(url, parsed_urls):
@@ -561,7 +645,7 @@ def parse_url(url, parsed_urls):
         match = parse_mastodon_uri(url)
         if match is not None:
             parsed_urls[url] = match
-    
+
     if url not in parsed_urls:
         match = parse_pleroma_url(url)
         if match is not None:
@@ -583,9 +667,14 @@ def parse_url(url, parsed_urls):
             parsed_urls[url] = match
 
     if url not in parsed_urls:
-        log(f"Error parsing toot URL {url}")
+        match = parse_peertube_url(url)
+        if match is not None:
+            parsed_urls[url] = match
+
+    if url not in parsed_urls:
+        logger.error(f"Error parsing toot URL {url}")
         parsed_urls[url] = None
-    
+
     return parsed_urls[url]
 
 def parse_mastodon_profile_url(url):
@@ -623,7 +712,7 @@ def parse_pleroma_url(url):
         url = get_redirect_url(url)
         if url is None:
             return None
-        
+
         match = re.match(r"/notice/(?P<toot_id>[^/]+)", url)
         if match is not None:
             return (server, match.group("toot_id"))
@@ -655,6 +744,15 @@ def parse_misskey_url(url):
         return (match.group("server"), match.group("toot_id"))
     return None
 
+def parse_peertube_url(url):
+    """parse a Misskey URL and return the server and ID"""
+    match = re.match(
+        r"https://(?P<server>[^/]+)/videos/watch/(?P<toot_id>[^/]+)", url
+    )
+    if match is not None:
+        return (match.group("server"), match.group("toot_id"))
+    return None
+
 def parse_pixelfed_profile_url(url):
     """parse a Pixelfed Profile URL and return the server and username"""
     match = re.match(r"https://(?P<server>[^/]+)/(?P<username>[^/]+)", url)
@@ -678,6 +776,12 @@ def parse_lemmy_profile_url(url):
         return (match.group("server"), match.group("username"))
     return None
 
+def parse_peertube_profile_url(url):
+    match = re.match(r"https://(?P<server>[^/]+)/accounts/(?P<username>[^/]+)", url)
+    if match is not None:
+        return (match.group("server"), match.group("username"))
+    return None
+
 def get_redirect_url(url):
     """get the URL given URL redirects to"""
     try:
@@ -685,17 +789,17 @@ def get_redirect_url(url):
             'User-Agent': 'FediFetcher (https://go.thms.uk/mgr)'
         })
     except Exception as ex:
-        log(f"Error getting redirect URL for URL {url}. Exception: {ex}")
+        logger.error(f"Error getting redirect URL for URL {url}. Exception: {ex}")
         return None
 
     if resp.status_code == 200:
         return url
     elif resp.status_code == 302:
         redirect_url = resp.headers["Location"]
-        log(f"Discovered redirect for URL {url}")
+        logger.debug(f"Discovered redirect for URL {url}")
         return redirect_url
     else:
-        log(
+        logger.error(
             f"Error getting redirect URL for URL {url}. Status code: {resp.status_code}"
         )
         return None
@@ -717,7 +821,7 @@ def get_toot_context(server, toot_id, toot_url, seen_hosts):
 
     post_server = get_server_info(server, seen_hosts)
     if post_server is None:
-        log(f'server {server} not found for post')
+        logger.error(f'server {server} not found for post')
         return []
 
     if post_server['mastodonApiSupport']:
@@ -726,8 +830,10 @@ def get_toot_context(server, toot_id, toot_url, seen_hosts):
         return get_lemmy_urls(post_server['webserver'], toot_id, toot_url)
     if post_server['misskeyApiSupport']:
         return get_misskey_urls(post_server['webserver'], toot_id, toot_url)
+    if post_server['peertubeApiSupport']:
+        return get_peertube_urls(post_server['webserver'], toot_id, toot_url)
 
-    log(f'unknown server api for {server}')
+    logger.error(f'unknown server api for {server}')
     return []
 
 def get_mastodon_urls(webserver, toot_id, toot_url):
@@ -735,19 +841,19 @@ def get_mastodon_urls(webserver, toot_id, toot_url):
     try:
         resp = get(url)
     except Exception as ex:
-        log(f"Error getting context for toot {toot_url}. Exception: {ex}")
+        logger.error(f"Error getting context for toot {toot_url}. Exception: {ex}")
         return []
 
     if resp.status_code == 200:
         try:
             res = resp.json()
-            log(f"Got context for toot {toot_url}")
+            logger.debug(f"Got context for toot {toot_url}")
             return (toot["url"] for toot in (res["ancestors"] + res["descendants"]))
         except Exception as ex:
-            log(f"Error parsing context for toot {toot_url}. Exception: {ex}")
+            logger.error(f"Error parsing context for toot {toot_url}. Exception: {ex}")
         return []
 
-    log(
+    logger.error(
         f"Error getting context for toot {toot_url}. Status code: {resp.status_code}"
     )
     return []
@@ -758,7 +864,7 @@ def get_lemmy_urls(webserver, toot_id, toot_url):
     if toot_url.find("/post/") != -1:
         return get_lemmy_comments_urls(webserver, toot_id, toot_url)
     else:
-        log(f'unknown lemmy url type {toot_url}')
+        logger.error(f'unknown lemmy url type {toot_url}')
         return []
 
 def get_lemmy_comment_context(webserver, toot_id, toot_url):
@@ -767,16 +873,16 @@ def get_lemmy_comment_context(webserver, toot_id, toot_url):
     try:
         resp = get(comment)
     except Exception as ex:
-        log(f"Error getting comment {toot_id} from {toot_url}. Exception: {ex}")
+        logger.error(f"Error getting comment {toot_id} from {toot_url}. Exception: {ex}")
         return []
-    
+
     if resp.status_code == 200:
         try:
             res = resp.json()
             post_id = res['comment_view']['comment']['post_id']
             return get_lemmy_comments_urls(webserver, post_id, toot_url)
         except Exception as ex:
-            log(f"Error parsing context for comment {toot_url}. Exception: {ex}")
+            logger.error(f"Error parsing context for comment {toot_url}. Exception: {ex}")
         return []
 
 def get_lemmy_comments_urls(webserver, post_id, toot_url):
@@ -786,7 +892,7 @@ def get_lemmy_comments_urls(webserver, post_id, toot_url):
     try:
         resp = get(url)
     except Exception as ex:
-        log(f"Error getting post {post_id} from {toot_url}. Exception: {ex}")
+        logger.error(f"Error getting post {post_id} from {toot_url}. Exception: {ex}")
         return []
 
     if resp.status_code == 200:
@@ -796,27 +902,39 @@ def get_lemmy_comments_urls(webserver, post_id, toot_url):
                 return []
             urls.append(res['post_view']['post']['ap_id'])
         except Exception as ex:
-            log(f"Error parsing post {post_id} from {toot_url}. Exception: {ex}")
+            logger.error(f"Error parsing post {post_id} from {toot_url}. Exception: {ex}")
 
     url = f"https://{webserver}/api/v3/comment/list?post_id={post_id}&sort=New&limit=50"
     try:
         resp = get(url)
     except Exception as ex:
-        log(f"Error getting comments for post {post_id} from {toot_url}. Exception: {ex}")
+        logger.error(f"Error getting comments for post {post_id} from {toot_url}. Exception: {ex}")
         return []
 
     if resp.status_code == 200:
         try:
             res = resp.json()
             list_of_urls = [comment_info['comment']['ap_id'] for comment_info in res['comments']]
-            log(f"Got {len(list_of_urls)} comments for post {toot_url}")
+            logger.debug(f"Got {len(list_of_urls)} comments for post {toot_url}")
             urls.extend(list_of_urls)
             return urls
         except Exception as ex:
-            log(f"Error parsing comments for post {toot_url}. Exception: {ex}")
+            logger.error(f"Error parsing comments for post {toot_url}. Exception: {ex}")
 
-    log(f"Error getting comments for post {toot_url}. Status code: {resp.status_code}")
+    logger.error(f"Error getting comments for post {toot_url}. Status code: {resp.status_code}")
     return []
+
+def get_peertube_urls(webserver, post_id, toot_url):
+    """get the URLs of the comments of a given peertube video"""
+    comments = f"https://{webserver}/api/v1/videos/{post_id}/comment-threads"
+    try:
+        resp = get(comments)
+    except Exception as ex:
+        logger.error(f"Error getting comments on video {post_id} from {toot_url}. Exception: {ex}")
+        return []
+
+    if resp.status_code == 200:
+        return [comment['url'] for comment in resp.json()['data']]
 
 def get_misskey_urls(webserver, post_id, toot_url):
     """get the URLs of the comments of a given misskey post"""
@@ -826,37 +944,37 @@ def get_misskey_urls(webserver, post_id, toot_url):
     try:
         resp = post(url, { 'noteId': post_id, 'limit': 100, 'depth': 12 })
     except Exception as ex:
-        log(f"Error getting post {post_id} from {toot_url}. Exception: {ex}")
+        logger.error(f"Error getting post {post_id} from {toot_url}. Exception: {ex}")
         return []
 
     if resp.status_code == 200:
         try:
             res = resp.json()
-            log(f"Got children for misskey post {toot_url}")
+            logger.debug(f"Got children for misskey post {toot_url}")
             list_of_urls = [f'https://{webserver}/notes/{comment_info["id"]}' for comment_info in res]
             urls.extend(list_of_urls)
         except Exception as ex:
-            log(f"Error parsing post {post_id} from {toot_url}. Exception: {ex}")
+            logger.error(f"Error parsing post {post_id} from {toot_url}. Exception: {ex}")
     else:
-        log(f"Error getting post {post_id} from {toot_url}. Status Code: {resp.status_code}")
+        logger.error(f"Error getting post {post_id} from {toot_url}. Status Code: {resp.status_code}")
 
     url = f"https://{webserver}/api/notes/conversation"
     try:
         resp = post(url, { 'noteId': post_id, 'limit': 100 })
     except Exception as ex:
-        log(f"Error getting post {post_id} from {toot_url}. Exception: {ex}")
+        logger.error(f"Error getting post {post_id} from {toot_url}. Exception: {ex}")
         return []
 
     if resp.status_code == 200:
         try:
             res = resp.json()
-            log(f"Got conversation for misskey post {toot_url}")
+            logger.debug(f"Got conversation for misskey post {toot_url}")
             list_of_urls = [f'https://{webserver}/notes/{comment_info["id"]}' for comment_info in res]
             urls.extend(list_of_urls)
         except Exception as ex:
-            log(f"Error parsing post {post_id} from {toot_url}. Exception: {ex}")
+            logger.error(f"Error parsing post {post_id} from {toot_url}. Exception: {ex}")
     else:
-        log(f"Error getting post {post_id} from {toot_url}. Status Code: {resp.status_code}")
+        logger.error(f"Error getting post {post_id} from {toot_url}. Status Code: {resp.status_code}")
 
     return urls
 
@@ -873,7 +991,7 @@ def add_context_urls(server, access_token, context_urls, seen_urls):
             else:
                 failed += 1
 
-    log(f"Added {count} new context toots (with {failed} failures)")
+    logger.info(f"Added {count} new context toots (with {failed} failures)")
 
 
 def add_context_url(url, server, access_token):
@@ -885,26 +1003,26 @@ def add_context_url(url, server, access_token):
             "Authorization": f"Bearer {access_token}",
         })
     except Exception as ex:
-        log(
+        logger.error(
             f"Error adding url {search_url} to server {server}. Exception: {ex}"
         )
         return False
 
     if resp.status_code == 200:
-        log(f"Added context url {url}")
+        logger.debug(f"Added context url {url}")
         return True
     elif resp.status_code == 403:
-        log(
+        logger.error(
             f"Error adding url {search_url} to server {server}. Status code: {resp.status_code}. "
             "Make sure you have the read:search scope enabled for your access token."
         )
         return False
     else:
-        log(
+        logger.error(
             f"Error adding url {search_url} to server {server}. Status code: {resp.status_code}"
         )
         return False
-    
+
 def get_paginated_mastodon(url, max, headers = {}, timeout = 0, max_tries = 5):
     """Make a paginated request to mastodon"""
     if(isinstance(max, int)):
@@ -961,26 +1079,89 @@ def get_paginated_mastodon(url, max, headers = {}, timeout = 0, max_tries = 5):
                 break
     return result
 
+def get_robots_txt_cache_path(robots_url):
+    hash = xxhash.xxh128(robots_url.encode('utf-8'))
+    return os.path.join(arguments.state_dir, f'robots-{hash.hexdigest()}.txt')
 
-def get(url, headers = {}, timeout = 0, max_tries = 5):
+def get_cached_robots(robots_url):
+    ## firstly: check the in-memory cache
+    if robots_url in ROBOTS_TXT:
+        return ROBOTS_TXT[robots_url]
+
+    robotsCachePath = get_robots_txt_cache_path(robots_url)
+    if os.path.exists(robotsCachePath):
+        with open(robotsCachePath, "r", encoding="utf-8") as f:
+            logger.debug(f"Getting robots.txt file from cache for {robots_url}.")
+            robotsTxt = f.read()
+            ROBOTS_TXT[robots_url] = robotsTxt
+            return robotsTxt
+
+    return None
+
+def get_robots_from_url(robots_url):
+    robotsTxt = get_cached_robots(robots_url)
+    if robotsTxt != None:
+        return robotsTxt
+
+    try:
+        # We are getting the robots.txt manually from here, because otherwise we can't change the User Agent
+        robotsTxt = get(robots_url, timeout = 2, ignore_robots_txt=True)
+        if robotsTxt.status_code in (401, 403):
+            robotsTxt = False
+        else:
+            robotsTxt = robotsTxt.text
+            with open(get_robots_txt_cache_path(robots_url), "w", encoding="utf-8") as f:
+                f.write(robotsTxt)
+
+    except Exception:
+        robotsTxt = True
+
+    ROBOTS_TXT[robots_url] = robotsTxt
+    return robotsTxt
+
+
+def can_fetch(user_agent, url):
+    parsed_uri = urlparse(url)
+    robots_url = '{uri.scheme}://{uri.netloc}/robots.txt'.format(uri=parsed_uri)
+
+    if parsed_uri.netloc in INSTANCE_BLOCKLIST:
+        # Never connect to these locations
+        raise Exception(f"Connecting to {parsed_uri.netloc} is prohibited by the configured blocklist")
+
+    robotsTxt = get_robots_from_url(robots_url)
+    if isinstance(robotsTxt, bool):
+        return robotsTxt
+
+    robotParser = urllib.robotparser.RobotFileParser()
+    robotParser.parse(robotsTxt.splitlines())
+    return robotParser.can_fetch(user_agent, url)
+
+
+def user_agent():
+    return f"FediFetcher/{VERSION}; +{arguments.server} (https://go.thms.uk/ff)"
+
+def get(url, headers = {}, timeout = 0, max_tries = 5, ignore_robots_txt = False):
     """A simple wrapper to make a get request while providing our user agent, and respecting rate limits"""
     h = headers.copy()
     if 'User-Agent' not in h:
-        h['User-Agent'] = 'FediFetcher (https://go.thms.uk/mgr)'
+        h['User-Agent'] = user_agent()
+
+    if not ignore_robots_txt and not can_fetch(h['User-Agent'], url):
+        raise Exception(f"Querying {url} prohibited by robots.txt")
 
     if timeout == 0:
         timeout = arguments.http_timeout
-        
+
     response = requests.get( url, headers= h, timeout=timeout)
     if response.status_code == 429:
         if max_tries > 0:
             reset = parser.parse(response.headers['x-ratelimit-reset'])
             now = datetime.now(datetime.now().astimezone().tzinfo)
             wait = (reset - now).total_seconds() + 1
-            log(f"Rate Limit hit requesting {url}. Waiting {wait} sec to retry at {response.headers['x-ratelimit-reset']}")
+            logger.warning(f"Rate Limit hit requesting {url}. Waiting {wait} sec to retry at {response.headers['x-ratelimit-reset']}")
             time.sleep(wait)
             return get(url, headers, timeout, max_tries - 1)
-        
+
         raise Exception(f"Maximum number of retries exceeded for rate limited request {url}")
     return response
 
@@ -988,7 +1169,10 @@ def post(url, json, headers = {}, timeout = 0, max_tries = 5):
     """A simple wrapper to make a post request while providing our user agent, and respecting rate limits"""
     h = headers.copy()
     if 'User-Agent' not in h:
-        h['User-Agent'] = 'FediFetcher (https://go.thms.uk/mgr)'
+        h['User-Agent'] = user_agent()
+
+    if not can_fetch(h['User-Agent'], url):
+        raise Exception(f"Querying {url} prohibited by robots.txt")
 
     if timeout == 0:
         timeout = arguments.http_timeout
@@ -999,15 +1183,12 @@ def post(url, json, headers = {}, timeout = 0, max_tries = 5):
             reset = parser.parse(response.headers['x-ratelimit-reset'])
             now = datetime.now(datetime.now().astimezone().tzinfo)
             wait = (reset - now).total_seconds() + 1
-            log(f"Rate Limit hit requesting {url}. Waiting {wait} sec to retry at {response.headers['x-ratelimit-reset']}")
+            logger.warning(f"Rate Limit hit requesting {url}. Waiting {wait} sec to retry at {response.headers['x-ratelimit-reset']}")
             time.sleep(wait)
             return post(url, json, headers, timeout, max_tries - 1)
 
         raise Exception(f"Maximum number of retries exceeded for rate limited request {url}")
     return response
-
-def log(text):
-    print(f"{datetime.now()} {datetime.now().astimezone().tzinfo}: {text}")
 
 class ServerList:
     def __init__(self, iterable):
@@ -1022,10 +1203,10 @@ class ServerList:
 
     def get(self, key):
         return self._dict[key]
-    
+
     def pop(self,key):
         return self._dict.pop(key)
-    
+
     def __contains__(self, item):
         return item in self._dict
 
@@ -1034,7 +1215,7 @@ class ServerList:
 
     def __len__(self):
         return len(self._dict)
-    
+
     def toJSON(self):
         return json.dumps(self._dict,default=str)
 
@@ -1063,7 +1244,7 @@ class OrderedSet:
 
     def pop(self, item):
         self._dict.pop(item)
-    
+
     def get(self, item):
         return self._dict[item]
 
@@ -1079,7 +1260,7 @@ class OrderedSet:
 
     def __len__(self):
         return len(self._dict)
-    
+
     def toJSON(self):
         return json.dumps(self._dict,default=str)
 
@@ -1088,7 +1269,7 @@ def get_server_from_host_meta(server):
     try:
         resp = get(url, timeout = 30)
     except Exception as ex:
-        log(f"Error getting host meta for {server}. Exception: {ex}")
+        logger.error(f"Error getting host meta for {server}. Exception: {ex}")
         return None
 
     if resp.status_code == 200:
@@ -1105,10 +1286,10 @@ def get_server_from_host_meta(server):
                 raise Exception(f'server not found in lrdd for {server}')
                 return None
         except Exception as ex:
-            log(f'Error parsing host meta for {server}. Exception: {ex}')
+            logger.error(f'Error parsing host meta for {server}. Exception: {ex}')
             return None
     else:
-        log(f'Error getting host meta for {server}. Status Code: {resp.status_code}')
+        logger.error(f'Error getting host meta for {server}. Status Code: {resp.status_code}')
         return None
 
 def get_nodeinfo(server, seen_hosts, host_meta_fallback = False):
@@ -1116,18 +1297,18 @@ def get_nodeinfo(server, seen_hosts, host_meta_fallback = False):
     try:
         resp = get(url, timeout = 30)
     except Exception as ex:
-        log(f"Error getting host node info for {server}. Exception: {ex}")
+        logger.error(f"Error getting host node info for {server}. Exception: {ex}")
         return None
 
     # if well-known nodeinfo isn't found, try to check host-meta for a webfinger URL
     # needed on servers where the display domain is different than the web domain
     if resp.status_code != 200 and not host_meta_fallback:
         # not found, try to check host-meta as a fallback
-        log(f'nodeinfo for {server} not found, checking host-meta')
+        logger.debug(f'nodeinfo for {server} not found, checking host-meta')
         new_server = get_server_from_host_meta(server)
         if new_server is not None:
             if new_server == server:
-                log(f'host-meta for {server} did not get a new server.')
+                logger.debug(f'host-meta for {server} did not get a new server.')
                 return None
             else:
                 return get_nodeinfo(new_server, seen_hosts, True)
@@ -1146,14 +1327,14 @@ def get_nodeinfo(server, seen_hosts, host_meta_fallback = False):
                     nodeLoc = link['href']
                     break
         except Exception as ex:
-            log(f'error getting server {server} info from well-known node info. Exception: {ex}')
+            logger.error(f'error getting server {server} info from well-known node info. Exception: {ex}')
             return None
     else:
-        log(f'Error getting well-known host node info for {server}. Status Code: {resp.status_code}')
+        logger.error(f'Error getting well-known host node info for {server}. Status Code: {resp.status_code}')
         return None
 
     if nodeLoc is None:
-        log(f'could not find link to node info in well-known nodeinfo of {server}')
+        logger.error(f'could not find link to node info in well-known nodeinfo of {server}')
         return None
 
     # regrab server from nodeLoc, again in the case of different display and web domains
@@ -1161,7 +1342,7 @@ def get_nodeinfo(server, seen_hosts, host_meta_fallback = False):
         r"https://(?P<server>[^/]+)/", nodeLoc
     )
     if match is None:
-        log(f"Error getting web server name from {server}.")
+        logger.error(f"Error getting web server name from {server}.")
         return None
 
     server = match.group('server')
@@ -1173,14 +1354,14 @@ def get_nodeinfo(server, seen_hosts, host_meta_fallback = False):
     try:
         resp = get(nodeLoc, timeout = 30)
     except Exception as ex:
-        log(f"Error getting host node info for {server}. Exception: {ex}")
+        logger.error(f"Error getting host node info for {server}. Exception: {ex}")
         return None
 
     if resp.status_code == 200:
         try:
             nodeInfo = resp.json()
             if 'activitypub' not in nodeInfo['protocols']:
-                log(f'server {server} does not support activitypub, skipping')
+                logger.warning(f'server {server} does not support activitypub, skipping')
                 return None
             return {
                 'webserver': server,
@@ -1189,10 +1370,10 @@ def get_nodeinfo(server, seen_hosts, host_meta_fallback = False):
                 'rawnodeinfo': nodeInfo,
             }
         except Exception as ex:
-            log(f'error getting server {server} info from nodeinfo. Exception: {ex}')
+            logger.error(f'error getting server {server} info from nodeinfo. Exception: {ex}')
             return None
     else:
-        log(f'Error getting host node info for {server}. Status Code: {resp.status_code}')
+        logger.error(f'Error getting host node info for {server}. Status Code: {resp.status_code}')
         return None
 
 def get_server_info(server, seen_hosts):
@@ -1218,9 +1399,10 @@ def get_server_info(server, seen_hosts):
 def set_server_apis(server):
     # support for new server software should be added here
     software_apis = {
-        'mastodonApiSupport': ['mastodon', 'pleroma', 'akkoma', 'pixelfed', 'hometown', 'iceshrimp'],
+        'mastodonApiSupport': ['mastodon', 'pleroma', 'akkoma', 'pixelfed', 'hometown', 'iceshrimp', 'Iceshrimp.NET'],
         'misskeyApiSupport': ['misskey', 'calckey', 'firefish', 'foundkey', 'sharkey'],
-        'lemmyApiSupport': ['lemmy']
+        'lemmyApiSupport': ['lemmy'],
+        'peertubeApiSupport': ['peertube']
     }
 
     # software that has specific API support but is not compatible with FediFetcher for various reasons:
@@ -1237,12 +1419,68 @@ def set_server_apis(server):
 
     server['last_checked'] = datetime.now()
 
+def get_user_lists(server, token):
+    return get_paginated_mastodon(f"https://{server}/api/v1/lists", 99, {
+        "Authorization": f"Bearer {token}",
+    })
+
+def get_list_timeline(server, list, token, max):
+    """Get all post in the user's home timeline"""
+
+    url = f"https://{server}/api/v1/timelines/list/{list['id']}"
+
+    posts = get_paginated_mastodon(url, max, {
+        "Authorization": f"Bearer {token}",
+    })
+
+    logger.info(f"Found {len(posts)} toots in list {list['title']}")
+
+    return posts
+
+def get_list_users(server, list, token, max):
+    url = f"https://{server}/api/v1/lists/{list['id']}/accounts"
+    accounts = get_paginated_mastodon(url, max, {
+        "Authorization": f"Bearer {token}",
+    })
+    logger.info(f"Found {len(accounts)} accounts in list {list['title']}")
+    return accounts
+
+def fetch_timeline_context(timeline_posts, token, parsed_urls, seen_hosts, seen_urls, all_known_users, recently_checked_users):
+    known_context_urls = get_all_known_context_urls(arguments.server, timeline_posts,parsed_urls, seen_hosts)
+    add_context_urls(arguments.server, token, known_context_urls, seen_urls)
+
+    # Backfill any post authors, and any mentioned users
+    if arguments.backfill_mentioned_users > 0:
+        mentioned_users = []
+        cut_off = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(minutes=60)
+        for toot in timeline_posts:
+            these_users = []
+            toot_created_at = parser.parse(toot['created_at'])
+            if len(mentioned_users) < 10 or (toot_created_at > cut_off and len(mentioned_users) < 30):
+                these_users.append(toot['account'])
+                if(len(toot['mentions'])):
+                    these_users += toot['mentions']
+                if(toot['reblog'] != None):
+                    these_users.append(toot['reblog']['account'])
+                    if(len(toot['reblog']['mentions'])):
+                        these_users += toot['reblog']['mentions']
+            for user in these_users:
+                if user not in mentioned_users and user['acct'] not in all_known_users:
+                    mentioned_users.append(user)
+
+        add_user_posts(arguments.server, token, filter_known_users(mentioned_users, all_known_users), recently_checked_users, all_known_users, seen_urls, seen_hosts)
+
 if __name__ == "__main__":
     start = datetime.now()
 
-    log(f"Starting FediFetcher")
-
     arguments = argparser.parse_args()
+
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.basicConfig(
+        format=f"{arguments.log_format}",
+        datefmt="%Y-%m-%d %H:%M:%S %Z",
+        level=arguments.log_level.upper(),
+    )
 
     if(arguments.config != None):
         if os.path.exists(arguments.config):
@@ -1252,56 +1490,83 @@ if __name__ == "__main__":
             for key in config:
                 setattr(arguments, key.lower().replace('-','_'), config[key])
 
+            logger.setLevel(arguments.log_level.upper())
+
         else:
-            log(f"Config file {arguments.config} doesn't exist")
+            logger.critical(f"Config file {arguments.config} doesn't exist")
             sys.exit(1)
 
+    for envvar, value in os.environ.items():
+        envvar = envvar.lower()
+        if envvar.startswith("ff_") and not envvar.startswith("ff_access_token"):
+            envvar = envvar[3:]
+            # most settings are numerical
+            if envvar not in [
+                "server",
+                "lock_file",
+                "state_dir",
+                "on_start",
+                "on_done",
+                "on_fail",
+                "log_level",
+                "log_format",
+                "instance_blocklist"
+            ]:
+                value = int(value)
+            setattr(arguments, envvar, value)
+
+    # remains special-cased for specifying multiple tokens
+    if tokens := [token for envvar, token in os.environ.items() if envvar.lower().startswith("ff_access_token")]:
+        arguments.access_token = tokens
+
+    logger.info("Starting FediFetcher")
+
     if(arguments.server == None or arguments.access_token == None):
-        log("You must supply at least a server name and an access token")
+        logger.critical("You must supply at least a server name and an access token")
         sys.exit(1)
 
-    # in case someone provided the server name as url instead, 
+    # in case someone provided the server name as url instead,
     setattr(arguments, 'server', re.sub(r"^(https://)?([^/]*)/?$", "\\2", arguments.server))
-        
+
 
     runId = uuid.uuid4()
 
     if(arguments.on_start != None and arguments.on_start != ''):
         try:
-            get(f"{arguments.on_start}?rid={runId}")
+            get(f"{arguments.on_start}?rid={runId}", ignore_robots_txt = True)
         except Exception as ex:
-            log(f"Error getting callback url: {ex}")
+            logger.error(f"Error getting callback url: {ex}")
 
     if arguments.lock_file is None:
         arguments.lock_file = os.path.join(arguments.state_dir, 'lock.lock')
     LOCK_FILE = arguments.lock_file
 
     if( os.path.exists(LOCK_FILE)):
-        log(f"Lock file exists at {LOCK_FILE}")
+        logger.debug(f"Lock file exists at {LOCK_FILE}")
 
         try:
             with open(LOCK_FILE, "r", encoding="utf-8") as f:
                 lock_time = parser.parse(f.read())
 
-            if (datetime.now() - lock_time).total_seconds() >= arguments.lock_hours * 60 * 60: 
+            if (datetime.now() - lock_time).total_seconds() >= arguments.lock_hours * 60 * 60:
                 os.remove(LOCK_FILE)
-                log(f"Lock file has expired. Removed lock file.")
+                logger.debug("Lock file has expired. Removed lock file.")
             else:
-                log(f"Lock file age is {datetime.now() - lock_time} - below --lock-hours={arguments.lock_hours} provided.")
+                logger.critical(f"Lock file age is {datetime.now() - lock_time} - below --lock-hours={arguments.lock_hours} provided.")
                 if(arguments.on_fail != None and arguments.on_fail != ''):
                     try:
-                        get(f"{arguments.on_fail}?rid={runId}")
+                        get(f"{arguments.on_fail}?rid={runId}", ignore_robots_txt = True)
                     except Exception as ex:
-                        log(f"Error getting callback url: {ex}")
+                        logger.error(f"Error getting callback url: {ex}")
                 sys.exit(1)
 
         except Exception:
-            log(f"Cannot read logfile age - aborting.")
+            logger.critical("Cannot read logfile age - aborting.")
             if(arguments.on_fail != None and arguments.on_fail != ''):
                 try:
-                    get(f"{arguments.on_fail}?rid={runId}")
+                    get(f"{arguments.on_fail}?rid={runId}", ignore_robots_txt = True)
                 except Exception as ex:
-                    log(f"Error getting callback url: {ex}")
+                    logger.error(f"Error getting callback url: {ex}")
             sys.exit(1)
 
     with open(LOCK_FILE, "w", encoding="utf-8") as f:
@@ -1314,7 +1579,10 @@ if __name__ == "__main__":
         KNOWN_FOLLOWINGS_FILE = os.path.join(arguments.state_dir, "known_followings")
         RECENTLY_CHECKED_USERS_FILE = os.path.join(arguments.state_dir, "recently_checked_users")
         SEEN_HOSTS_FILE = os.path.join(arguments.state_dir, "seen_hosts")
+        RECENTLY_CHECKED_CONTEXTS_FILE = os.path.join(arguments.state_dir, 'recent_context')
 
+        INSTANCE_BLOCKLIST = [x.strip() for x in arguments.instance_blocklist.split(",")]
+        ROBOTS_TXT = {}
 
         seen_urls = OrderedSet([])
         if os.path.exists(SEEN_URLS_FILE):
@@ -1341,7 +1609,22 @@ if __name__ == "__main__":
             lastCheck = recently_checked_users.get(user)
             userAge = datetime.now(lastCheck.tzinfo) - lastCheck
             if(userAge.total_seconds() > arguments.remember_users_for_hours * 60 * 60):
-                recently_checked_users.pop(user)    
+                recently_checked_users.pop(user)
+
+        recently_checked_context = {}
+        if(os.path.exists(RECENTLY_CHECKED_CONTEXTS_FILE)):
+            with open(RECENTLY_CHECKED_CONTEXTS_FILE, "r", encoding="utf-8") as f:
+                recently_checked_context = json.load(f)
+
+        # Remove any toots that we haven't seen in a while, to ensure this doesn't grow indefinitely
+        for tootUrl in list(recently_checked_context):
+            recently_checked_context[tootUrl]['lastSeen'] = parser.parse(recently_checked_context[tootUrl]['lastSeen'])
+            recently_checked_context[tootUrl]['created_at'] = parser.parse(recently_checked_context[tootUrl]['created_at'])
+            lastSeen = recently_checked_context[tootUrl]['lastSeen']
+            userAge = datetime.now(lastSeen.tzinfo) - lastSeen
+            # dont really need to keep track for more than 7 days: if we haven't seen it in 7 days we can refetch content anyway
+            if(userAge.total_seconds() > 7 * 24 * 60 * 60):
+                recently_checked_context.pop(tootUrl)
 
         parsed_urls = {}
 
@@ -1353,7 +1636,9 @@ if __name__ == "__main__":
 
             for host in list(seen_hosts):
                 serverInfo = seen_hosts.get(host)
-                if 'last_checked' in serverInfo:
+                if 'peertubeApiSupport' not in serverInfo:
+                    seen_hosts.pop(host)
+                elif 'last_checked' in serverInfo:
                     serverAge = datetime.now(serverInfo['last_checked'].tzinfo) - serverInfo['last_checked']
                     if(serverAge.total_seconds() > arguments.remember_hosts_for_days * 24 * 60 * 60 ):
                         seen_hosts.pop(host)
@@ -1363,10 +1648,34 @@ if __name__ == "__main__":
         else:
             seen_hosts = ServerList({})
 
+        # Delete any old robots.txt files so we can re-download them
+        for file_name in os.listdir(arguments.state_dir):
+            file_path = os.path.join(arguments.state_dir,file_name)
+            if file_name.startswith('robots-') and os.path.isfile(file_path):
+                if os.path.getmtime(file_path) < time.time() - 60 * 60 * 24:
+                    logger.debug(f"Removing cached robots.txt file {file_name}")
+                    os.remove(file_path)
+
+
         if(isinstance(arguments.access_token, str)):
             setattr(arguments, 'access_token', [arguments.access_token])
 
         for token in arguments.access_token:
+
+            if arguments.from_lists:
+                """Pull replies from lists"""
+                lists = get_user_lists(arguments.server, token)
+                logger.info(f"Getting context for {len(lists)} lists")
+                for user_list in lists:
+                    # Fill context from list
+                    if arguments.max_list_length > 0:
+                        timeline_toots = get_list_timeline(arguments.server, user_list, token, arguments.max_list_length)
+                        fetch_timeline_context(timeline_toots, token, parsed_urls, seen_hosts, seen_urls, all_known_users, recently_checked_users)
+
+                    # Backfill profiles from list
+                    if arguments.max_list_accounts:
+                        accounts = get_list_users(arguments.server, user_list, token, arguments.max_list_accounts)
+                        add_user_posts(arguments.server, token, accounts, recently_checked_users, all_known_users, seen_urls, seen_hosts)
 
             if arguments.reply_interval_in_hours > 0:
                 """pull the context toots of toots user replied to, from their
@@ -1386,61 +1695,40 @@ if __name__ == "__main__":
 
             if arguments.home_timeline_length > 0:
                 """Do the same with any toots on the key owner's home timeline """
+                logger.info("Getting context for home timeline")
                 timeline_toots = get_timeline(arguments.server, token, arguments.home_timeline_length)
-                known_context_urls = get_all_known_context_urls(arguments.server, timeline_toots,parsed_urls, seen_hosts)
-                add_context_urls(arguments.server, token, known_context_urls, seen_urls)
-
-                # Backfill any post authors, and any mentioned users
-                if arguments.backfill_mentioned_users > 0:
-                    mentioned_users = []
-                    cut_off = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(minutes=60)
-                    for toot in timeline_toots:
-                        these_users = []
-                        toot_created_at = parser.parse(toot['created_at'])
-                        if len(mentioned_users) < 10 or (toot_created_at > cut_off and len(mentioned_users) < 30):
-                            these_users.append(toot['account'])
-                            if(len(toot['mentions'])):
-                                these_users += toot['mentions']
-                            if(toot['reblog'] != None):
-                                these_users.append(toot['reblog']['account'])
-                                if(len(toot['reblog']['mentions'])):
-                                    these_users += toot['reblog']['mentions']
-                        for user in these_users:
-                            if user not in mentioned_users and user['acct'] not in all_known_users:
-                                mentioned_users.append(user)
-
-                    add_user_posts(arguments.server, token, filter_known_users(mentioned_users, all_known_users), recently_checked_users, all_known_users, seen_urls, seen_hosts)
+                fetch_timeline_context(timeline_toots, token, parsed_urls, seen_hosts, seen_urls, all_known_users, recently_checked_users)
 
             if arguments.max_followings > 0:
-                log(f"Getting posts from last {arguments.max_followings} followings")
+                logger.info(f"Getting posts from last {arguments.max_followings} followings")
                 user_id = get_user_id(arguments.server, arguments.user, token)
-                followings = get_new_followings(arguments.server, user_id, arguments.max_followings, all_known_users)
+                followings = get_new_followings(arguments.server, user_id, token, arguments.max_followings, all_known_users)
                 add_user_posts(arguments.server, token, followings, known_followings, all_known_users, seen_urls, seen_hosts)
-            
+
             if arguments.max_followers > 0:
-                log(f"Getting posts from last {arguments.max_followers} followers")
+                logger.info(f"Getting posts from last {arguments.max_followers} followers")
                 user_id = get_user_id(arguments.server, arguments.user, token)
-                followers = get_new_followers(arguments.server, user_id, arguments.max_followers, all_known_users)
+                followers = get_new_followers(arguments.server, user_id, token, arguments.max_followers, all_known_users)
                 add_user_posts(arguments.server, token, followers, recently_checked_users, all_known_users, seen_urls, seen_hosts)
 
             if arguments.max_follow_requests > 0:
-                log(f"Getting posts from last {arguments.max_follow_requests} follow requests")
+                logger.info(f"Getting posts from last {arguments.max_follow_requests} follow requests")
                 follow_requests = get_new_follow_requests(arguments.server, token, arguments.max_follow_requests, all_known_users)
                 add_user_posts(arguments.server, token, follow_requests, recently_checked_users, all_known_users, seen_urls, seen_hosts)
 
             if arguments.from_notifications > 0:
-                log(f"Getting notifications for last {arguments.from_notifications} hours")
+                logger.info(f"Getting notifications for last {arguments.from_notifications} hours")
                 notification_users = get_notification_users(arguments.server, token, all_known_users, arguments.from_notifications)
                 add_user_posts(arguments.server, token, notification_users, recently_checked_users, all_known_users, seen_urls, seen_hosts)
 
             if arguments.max_bookmarks > 0:
-                log(f"Pulling replies to the last {arguments.max_bookmarks} bookmarks")
+                logger.info(f"Pulling replies to the last {arguments.max_bookmarks} bookmarks")
                 bookmarks = get_bookmarks(arguments.server, token, arguments.max_bookmarks)
                 known_context_urls = get_all_known_context_urls(arguments.server, bookmarks,parsed_urls, seen_hosts)
                 add_context_urls(arguments.server, token, known_context_urls, seen_urls)
 
             if arguments.max_favourites > 0:
-                log(f"Pulling replies to the last {arguments.max_favourites} favourites")
+                logger.info(f"Pulling replies to the last {arguments.max_favourites} favourites")
                 favourites = get_favourites(arguments.server, token, arguments.max_favourites)
                 known_context_urls = get_all_known_context_urls(arguments.server, favourites,parsed_urls, seen_hosts)
                 add_context_urls(arguments.server, token, known_context_urls, seen_urls)
@@ -1460,22 +1748,25 @@ if __name__ == "__main__":
         with open(SEEN_HOSTS_FILE, "w", encoding="utf-8") as f:
             f.write(seen_hosts.toJSON())
 
+        with open(RECENTLY_CHECKED_CONTEXTS_FILE, "w", encoding="utf-8") as f:
+            f.write(json.dumps(recently_checked_context, default=str))
+
         os.remove(LOCK_FILE)
 
         if(arguments.on_done != None and arguments.on_done != ''):
             try:
-                get(f"{arguments.on_done}?rid={runId}")
+                get(f"{arguments.on_done}?rid={runId}", ignore_robots_txt = True)
             except Exception as ex:
-                log(f"Error getting callback url: {ex}")
+                logger.error(f"Error getting callback url: {ex}")
 
-        log(f"Processing finished in {datetime.now() - start}.")
+        logger.info(f"Processing finished in {datetime.now() - start}.")
 
-    except Exception as ex:
+    except Exception:
         os.remove(LOCK_FILE)
-        log(f"Job failed after {datetime.now() - start}.")
+        logger.error(f"Job failed after {datetime.now() - start}.")
         if(arguments.on_fail != None and arguments.on_fail != ''):
             try:
-                get(f"{arguments.on_fail}?rid={runId}")
+                get(f"{arguments.on_fail}?rid={runId}", ignore_robots_txt = True)
             except Exception as ex:
-                log(f"Error getting callback url: {ex}")
+                logger.error(f"Error getting callback url: {ex}")
         raise
