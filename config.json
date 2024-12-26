@@ -1,6 +1,6 @@
 {
   "server": "social.vrutkovs.eu",
-  "home-timeline-length": 200,
+  "home-timeline-length": 50,
   "max-followings": 80,
   "max-followers": 80,
   "max-follow-requests": 80,
