@@ -1113,8 +1113,6 @@ def user_agent():
 def get(url, headers = {}, timeout = 0, max_tries = 5, ignore_robots_txt = False):
     """A simple wrapper to make a get request while providing our user agent, and respecting rate limits"""
     logger.debug(f"Getting url {url}")
-    if url.startswith("https://social.vrutkovs.eu"):
-        return rate_limited_get(url, headers, timeout, max_tries, ignore_robots_txt)
 
     h = headers.copy()
     if 'User-Agent' not in h:
@@ -1127,6 +1125,12 @@ def get(url, headers = {}, timeout = 0, max_tries = 5, ignore_robots_txt = False
         timeout = arguments.http_timeout
 
     response = requests.get( url, headers= h, timeout=timeout)
+
+    elapsed = response.elapsed.total_seconds()
+    logger.debug(f"Completed in {elapsed} seconds")
+    if url.startswith("https://social.vrutkovs.eu") and elapsed > 0.5:
+        time.sleep(elapsed * 2)
+    
     if response.status_code == 429:
         if max_tries > 0:
             reset = parser.parse(response.headers['x-ratelimit-reset'])
