@@ -6,5 +6,5 @@
   "max-follow-requests": 20,
   "max-bookmarks": 20,
   "from-notifications": 0,
-  "backfill-with-context": 0
+  "backfill-with-context": 20
 }
