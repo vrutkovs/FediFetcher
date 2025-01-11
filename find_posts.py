@@ -17,6 +17,8 @@ import urllib.robotparser
 from urllib.parse import urlparse
 import xxhash
 
+from ratelimit import limits, sleep_and_retry
+
 logger = logging.getLogger("FediFetcher")
 robotParser = urllib.robotparser.RobotFileParser()
 
@@ -1110,6 +1112,10 @@ def user_agent():
 
 def get(url, headers = {}, timeout = 0, max_tries = 5, ignore_robots_txt = False):
     """A simple wrapper to make a get request while providing our user agent, and respecting rate limits"""
+    logger.debug(f"Getting url {url}")
+    if url.startswith("https://social.vrutkovs.eu"):
+        return rate_limited_get(url, headers, timeout, max_tries, ignore_robots_txt)
+
     h = headers.copy()
     if 'User-Agent' not in h:
         h['User-Agent'] = user_agent()
@@ -1133,8 +1139,39 @@ def get(url, headers = {}, timeout = 0, max_tries = 5, ignore_robots_txt = False
         raise Exception(f"Maximum number of retries exceeded for rate limited request {url}")
     return response
 
+
+@sleep_and_retry
+@limits(calls=5, period=60)
+def rate_limited_get(url, headers = {}, timeout = 0, max_tries = 5, ignore_robots_txt = False):
+    """A simple wrapper to make a get request while providing our user agent, and respecting rate limits"""
+    h = headers.copy()
+    if 'User-Agent' not in h:
+        h['User-Agent'] = user_agent()
+
+    if not ignore_robots_txt and not can_fetch(h['User-Agent'], url):
+        raise Exception(f"Querying {url} prohibited by robots.txt")
+
+    if timeout == 0:
+        timeout = arguments.http_timeout
+
+    response = requests.get( url, headers= h, timeout=timeout)
+    if response.status_code == 429:
+        if max_tries > 0:
+            reset = parser.parse(response.headers['x-ratelimit-reset'])
+            now = datetime.now(datetime.now().astimezone().tzinfo)
+            wait = (reset - now).total_seconds() + 1
+            logger.warning(f"Rate Limit hit requesting {url}. Waiting {wait} sec to retry at {response.headers['x-ratelimit-reset']}")
+            time.sleep(wait)
+            return get(url, headers, timeout, max_tries - 1)
+
+        raise Exception(f"Maximum number of retries exceeded for rate limited request {url}")
+    return response
+
+@sleep_and_retry
+@limits(calls=5, period=60)
 def post(url, json, headers = {}, timeout = 0, max_tries = 5):
     """A simple wrapper to make a post request while providing our user agent, and respecting rate limits"""
+    logger.debug(f"Posting to url {url}")
     h = headers.copy()
     if 'User-Agent' not in h:
         h['User-Agent'] = user_agent()
