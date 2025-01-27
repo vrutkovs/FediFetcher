@@ -1,10 +1,7 @@
 {
   "server": "social.vrutkovs.eu",
-  "home-timeline-length": 50,
-  "max-followings": 20,
-  "max-followers": 20,
-  "max-follow-requests": 20,
-  "max-bookmarks": 20,
-  "from-notifications": 1,
-  "backfill-with-context": 20
+  "home-timeline-length": 20,
+  "max-followings": 10,
+  "from-notifications": 0,
+  "backfill-with-context": 10
 }
