@@ -22,7 +22,7 @@ from ratelimit import limits, sleep_and_retry
 logger = logging.getLogger("FediFetcher")
 robotParser = urllib.robotparser.RobotFileParser()
 
-VERSION = "7.1.14"
+VERSION = "7.1.15"
 
 argparser=argparse.ArgumentParser()
 
@@ -631,6 +631,11 @@ def parse_url(url, parsed_urls):
             parsed_urls[url] = match
 
     if url not in parsed_urls:
+        match = parse_pleroma_uri(url)
+        if match is not None:
+            parsed_urls[url] = match
+
+    if url not in parsed_urls:
         match = parse_lemmy_url(url)
         if match is not None:
             parsed_urls[url] = match
@@ -696,6 +701,13 @@ def parse_pleroma_url(url):
         if match is not None:
             return (server, match.group("toot_id"))
         return None
+    return None
+
+def parse_pleroma_uri(uri):
+    """parse a Pleroma URL and return the server and ID"""
+    match = re.match(r"https://(?P<server>[^/]+)/notice/(?P<toot_id>[^/]+)", uri)
+    if match is not None:
+        return (match.group("server"), match.group("toot_id"))
     return None
 
 def parse_pleroma_profile_url(url):
