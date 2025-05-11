@@ -22,7 +22,7 @@ from ratelimit import limits, sleep_and_retry
 logger = logging.getLogger("FediFetcher")
 robotParser = urllib.robotparser.RobotFileParser()
 
-VERSION = "7.1.15"
+VERSION = "7.1.16"
 
 argparser=argparse.ArgumentParser()
 
